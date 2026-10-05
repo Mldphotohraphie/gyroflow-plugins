@@ -78,16 +78,58 @@ pub struct GyroflowPluginBase {
     // We should cache managers globally because it's common to have the effect applied to the same clip and cut the clip into multiple pieces
     // We don't want to create a new manager for each piece of the same clip
     // Cache key is specific enough
-    pub manager_cache: Mutex<LruCache<String, Arc<StabilizationManager>>>,
+    pub manager_cache: Mutex<ManagerCache>,
 
     pub context_initialized: bool,
 }
 impl Default for GyroflowPluginBase {
     fn default() -> Self {
         Self {
-            manager_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(8).unwrap())),
+            manager_cache: Mutex::new(ManagerCache::default()),
             context_initialized: false,
         }
+    }
+}
+
+pub struct ManagerCache {
+    entries: LruCache<String, Arc<StabilizationManager>>,
+    generation: u64,
+}
+
+impl Default for ManagerCache {
+    fn default() -> Self {
+        Self {
+            entries: LruCache::new(std::num::NonZeroUsize::new(8).unwrap()),
+            generation: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for ManagerCache {
+    type Target = LruCache<String, Arc<StabilizationManager>>;
+
+    fn deref(&self) -> &Self::Target { &self.entries }
+}
+
+impl std::ops::DerefMut for ManagerCache {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.entries }
+}
+
+fn resolve_cached_manager(
+    key: &str,
+    local: &mut LruCache<String, Arc<StabilizationManager>>,
+    local_generation: &mut u64,
+    shared: &mut ManagerCache,
+) -> Option<Arc<StabilizationManager>> {
+    if *local_generation != shared.generation {
+        local.clear();
+        *local_generation = shared.generation;
+    }
+    if let Some(stab) = shared.get(key).map(Arc::clone) {
+        local.put(key.to_owned(), stab.clone());
+        Some(stab)
+    } else {
+        local.get(key).map(Arc::clone)
     }
 }
 
@@ -279,7 +321,7 @@ impl GyroflowPluginBase {
             ] },
             ParameterType::Group { id: "AdjustGroup", label: "Adjust parameters", opened: true, parameters: vec![
                 ParameterType::Slider   { id: "Smoothness",             label: "Smoothness",           hint: "Smoothness",                   min: 1.0,    max: 300.0, default: 50.0 },
-                ParameterType::Slider   { id: "ZoomLimit",              label: "Zoom limit",           hint: "Zoom limit",                   min: 51.0,   max: 300.0, default: 130.0 },
+                ParameterType::Slider   { id: "ZoomLimit",              label: "Zoom limit",           hint: "Zoom limit",                   min: 51.0,   max: 300.0, default: 100.0 },
                 ParameterType::Slider   { id: "LensCorrectionStrength", label: "Lens correction",      hint: "Lens correction",              min: 0.0,    max: 100.0, default: 100.0 },
                 ParameterType::Slider   { id: "HorizonLockAmount",      label: "Horizon lock",         hint: "Horizon lock amount",          min: 0.0,    max: 100.0, default: 0.0 },
                 ParameterType::Slider   { id: "HorizonLockRoll",        label: "Horizon roll",         hint: "Horizon lock roll adjustment", min: -100.0, max: 100.0, default: 0.0 },
@@ -309,7 +351,7 @@ impl GyroflowPluginBase {
                 ParameterType::Select   { id: "Interpolation",   label: "Interpolation", hint: "Scaling interpolation method", options: vec!["Lanczos4", "RobidouxSharp", "Bilinear", "Bicubic", "Robidoux", "Mitchell", "CatmullRom"], default: "Lanczos4" },
             ] },
             ParameterType::Checkbox { id: "ToggleOverview",     label: "Stabilization overview",         hint: "Zooms out the view to see the stabilization results. Disable this before rendering.", default: false },
-            ParameterType::Checkbox { id: "DontDrawOutside",    label: "Don't draw outside source clip", hint: "When clip and timeline aspect ratio don't match, draw the final image inside the source clip, instead of drawing outside it.", default: false },
+            ParameterType::Checkbox { id: "DontDrawOutside",    label: "Don't draw outside source clip", hint: "When clip and timeline aspect ratio don't match, draw the final image inside the source clip, instead of drawing outside it.", default: true },
             ParameterType::Checkbox { id: "IncludeProjectData", label: "Embed .gyroflow data in plugin", hint: "If you intend to share the project to someone else, the plugin can embed the Gyroflow project data including gyro data inside the video editor project. This way you don't have to share .gyroflow project files. Enabling this option will make the project bigger.", default: false },
             ParameterType::Group { id: "InfoGroup", label: "Info", opened: true, parameters: vec![
                 ParameterType::Text { id: "LoadedProject",      label: "Loaded project",      hint: "Loaded project or video file" },
@@ -375,6 +417,9 @@ pub struct GyroflowPluginBaseInstance {
     #[serde(skip)]
     pub managers: LruCache<String, Arc<StabilizationManager>>,
 
+    #[serde(skip)]
+    pub manager_cache_generation: u64,
+
     pub reload_values_from_project: bool,
 
     pub original_video_size: (usize, usize),
@@ -395,6 +440,7 @@ impl Clone for GyroflowPluginBaseInstance {
     fn clone(&self) -> Self {
         Self {
             managers:                       self.managers.clone(),
+            manager_cache_generation:       self.manager_cache_generation,
             original_output_size:           self.original_output_size,
             original_video_size:            self.original_video_size,
             timeline_size:                  self.timeline_size,
@@ -416,6 +462,7 @@ impl Default for GyroflowPluginBaseInstance {
     fn default() -> Self {
         Self {
             managers:                       LruCache::new(std::num::NonZeroUsize::new(20).unwrap()),
+            manager_cache_generation:       0,
             original_output_size:           (0, 0),
             original_video_size:            (0, 0),
             timeline_size:                  (0, 0),
@@ -534,7 +581,7 @@ impl GyroflowPluginBaseInstance {
         kparams.cached_keyframes = mgr;
     }
 
-    pub fn stab_manager(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool) -> PluginResult<Arc<StabilizationManager>> {
+    pub fn stab_manager(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<ManagerCache>, out_size: (usize, usize), open_gyroflow_if_no_data: bool) -> PluginResult<Arc<StabilizationManager>> {
         let mut disable_stretch = params.get_bool(Params::DisableStretch)?;
 
         let instance_id = params.get_string(Params::InstanceId)?;
@@ -549,12 +596,16 @@ impl GyroflowPluginBaseInstance {
         }
 
         let key = format!("{path}{disable_stretch}{instance_id}");
-        let cloned = manager_cache.lock().get(&key).map(Arc::clone);
+        let cloned = {
+            let mut cache = manager_cache.lock();
+            resolve_cached_manager(
+                &key,
+                &mut self.managers,
+                &mut self.manager_cache_generation,
+                &mut cache,
+            )
+        };
         let stab = if let Some(stab) = cloned {
-            // Cache it in this instance as well
-            if !self.managers.contains(&key) {
-                self.managers.put(key.to_owned(), stab.clone());
-            }
             self.set_keyframe_provider(&stab);
             stab
         } else {
@@ -853,7 +904,7 @@ impl GyroflowPluginBaseInstance {
         Ok(stab)
     }
 
-    pub fn clear_stab(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>) {
+    pub fn clear_stab(&mut self, manager_cache: &Mutex<ManagerCache>) {
         let local_keys = self.managers.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
         self.managers.clear();
 
@@ -900,7 +951,7 @@ impl GyroflowPluginBaseInstance {
         }
     }
 
-    pub fn param_changed(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, param: Params, user_edited: bool) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn param_changed(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<ManagerCache>, param: Params, user_edited: bool) -> Result<(), Box<dyn std::error::Error>> {
         if param == Params::Browse {
             let new_path = Self::browse(&params.get_string(Params::ProjectPath)?);
             if !new_path.is_empty() {
@@ -1052,7 +1103,10 @@ impl GyroflowPluginBaseInstance {
             }
             if param == Params::Interpolation {
                 self.managers.clear();
-                manager_cache.lock().clear();
+                let mut cache = manager_cache.lock();
+                cache.clear();
+                cache.generation = cache.generation.wrapping_add(1);
+                self.manager_cache_generation = cache.generation;
             }
         }
 
@@ -1065,6 +1119,61 @@ pub fn hash_string(s: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_cache() -> LruCache<String, Arc<StabilizationManager>> {
+        LruCache::new(std::num::NonZeroUsize::new(20).unwrap())
+    }
+
+    #[test]
+    fn reuses_local_manager_after_shared_lru_eviction() {
+        let mut shared = ManagerCache::default();
+        let mut local = local_cache();
+        let mut generation = 0;
+        let first = Arc::new(StabilizationManager::default());
+        shared.put("first".into(), first.clone());
+        local.put("first".into(), first.clone());
+        for index in 0..8 {
+            shared.put(format!("other-{index}"), Arc::new(StabilizationManager::default()));
+        }
+
+        let resolved = resolve_cached_manager("first", &mut local, &mut generation, &mut shared).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &resolved));
+    }
+
+    #[test]
+    fn rejects_local_manager_after_shared_invalidation() {
+        let mut shared = ManagerCache::default();
+        let mut local = local_cache();
+        let mut generation = 0;
+        local.put("clip".into(), Arc::new(StabilizationManager::default()));
+        shared.generation += 1;
+
+        assert!(resolve_cached_manager("clip", &mut local, &mut generation, &mut shared).is_none());
+        assert!(!local.contains("clip"));
+        assert_eq!(generation, shared.generation);
+    }
+
+    #[test]
+    fn shared_manager_replaces_stale_local_manager() {
+        let mut shared = ManagerCache::default();
+        let mut local = local_cache();
+        let mut generation = 0;
+        let stale = Arc::new(StabilizationManager::default());
+        let current = Arc::new(StabilizationManager::default());
+        local.put("clip".into(), stale);
+        shared.put("clip".into(), current.clone());
+
+        let resolved = resolve_cached_manager("clip", &mut local, &mut generation, &mut shared).unwrap();
+
+        assert!(Arc::ptr_eq(&current, &resolved));
+        assert!(Arc::ptr_eq(&current, local.get("clip").unwrap()));
+    }
 }
 
 impl std::str::FromStr for Params {

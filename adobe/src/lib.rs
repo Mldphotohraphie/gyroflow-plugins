@@ -90,6 +90,7 @@ impl CrossThreadInstance {
         log::info!("new_base_instance: {:?}", instance_id);
         let mut gyroflow = GyroflowPluginBaseInstance {
             managers:                       LruCache::new(std::num::NonZeroUsize::new(20).unwrap()),
+            manager_cache_generation:       0,
             original_output_size:           (0, 0),
             original_video_size:            (0, 0),
             timeline_size:                  (0, 0),

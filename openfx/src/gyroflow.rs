@@ -124,7 +124,7 @@ struct InstanceData {
 }
 
 impl InstanceData {
-    fn stab_manager(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, output_rect: RectI, loading_pending_video_file: bool) -> Result<Arc<StabilizationManager>> {
+    fn stab_manager(&mut self, manager_cache: &Mutex<ManagerCache>, output_rect: RectI, loading_pending_video_file: bool) -> Result<Arc<StabilizationManager>> {
         /*let source_rect = self.source_clip.get_region_of_definition(0.0)?;
         let mut source_rect = RectI {
             x1: source_rect.x1 as i32,
@@ -504,6 +504,7 @@ impl Execute for GyroflowPlugin {
                     },
                     plugin: GyroflowPluginBaseInstance {
                         managers:                    LruCache::new(std::num::NonZeroUsize::new(20).unwrap()),
+                        manager_cache_generation:    0,
                         original_output_size:        (0, 0),
                         original_video_size:         (0, 0),
                         timeline_size:               (0, 0),
@@ -735,13 +736,10 @@ impl Execute for GyroflowPlugin {
 
                 effect_properties.set_single_instance(false)?;
                 effect_properties.set_host_frame_threading(false)?;
-                // InstanceSafe, not FullySafe: the Render action takes `&mut InstanceData`
-                // and mutates per-instance state (the stabilization manager cache, timeline
-                // size, parameters ...). FullySafe lets the host call Render concurrently on
-                // the *same* instance, which would alias that `&mut` (undefined behaviour) and
-                // race the parameter updates. InstanceSafe still allows different instances to
-                // render in parallel.
-                effect_properties.set_render_thread_safety(ImageEffectRender::InstanceSafe)?;
+                // Resolve creates many render workers, while Gyroflow keeps a GPU cache per
+                // worker. Serialize OFX renders so those caches cannot retain one Metal pipeline
+                // per active effect instance and exhaust unified memory.
+                effect_properties.set_render_thread_safety(ImageEffectRender::Unsafe)?;
                 effect_properties.set_supports_multi_resolution(true)?;
                 effect_properties.set_temporal_clip_access(true)?;
 
