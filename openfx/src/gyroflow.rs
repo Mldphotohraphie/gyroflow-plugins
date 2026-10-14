@@ -43,10 +43,13 @@ define_params!(ParamHandler {
         LoadedPreset        => loaded_preset:    ParamHandle<String>,
         LoadedLens          => loaded_lens:      ParamHandle<String>,
         ZoomInfo            => zoom_info:        ParamHandle<String>,
+        UseOriginal         => use_original:     ParamHandle<String>,
+        LoadSuggestedLens   => load_suggested_lens: ParamHandle<String>,
     ],
     bools: [
         DisableStretch        => disable_stretch:         ParamHandle<bool>,
         ToggleOverview        => toggle_overview:         ParamHandle<bool>,
+        FastPreview           => fast_preview:            ParamHandle<bool>,
         DontDrawOutside       => dont_draw_outside:       ParamHandle<bool>,
         IncludeProjectData    => include_project_data:    ParamHandle<bool>,
         UseGyroflowsKeyframes => use_gyroflows_keyframes: ParamHandle<bool>,
@@ -232,8 +235,23 @@ impl Execute for GyroflowPlugin {
                 // When it does, the gyro timestamps are exact and a frame rate difference is not a problem.
                 let src_frame = in_args.get_src_frame().ok();
 
-                if !has_gyro {
+                let original_found = instance_data.plugin.original_candidate.lock().clone();
+                {
+                    let want = (Some(original_found.is_some()), Some(instance_data.plugin.lens_suggestion.is_some()));
+                    if instance_data.plugin.suggestion_buttons != want {
+                        instance_data.plugin.suggestion_buttons = want;
+                        let _ = instance_data.params.set_enabled(Params::UseOriginal, want.0.unwrap_or(false));
+                        let _ = instance_data.params.set_enabled(Params::LoadSuggestedLens, want.1.unwrap_or(false));
+                    }
+                }
+
+                if !has_gyro && original_found.is_some() {
+                    let hint = format!("Ce fichier n'a pas de données gyro (fichier réexporté ou transcodé), mais l'original de la caméra a été trouvé : {}. Clique « Utiliser l'original trouvé » pour stabiliser avec lui.", original_found.as_deref().unwrap_or_default());
+                    instance_data.plugin.set_status(&mut instance_data.params, "Pas de gyro : original trouvé, clique « Utiliser l'original »", &hint, false);
+                } else if !has_gyro {
                     instance_data.plugin.set_status(&mut instance_data.params, "Pas de données gyro dans ce fichier", "Ce fichier ne contient pas de données gyroscopiques (fichier réexporté, transcodé, ou caméra sans gyro). Utilise le fichier original sorti de la caméra, ou ouvre le plan dans Gyroflow pour charger un fichier de mouvement séparé.", false);
+                } else if instance_data.params.get_bool(Params::FastPreview).unwrap_or(false) {
+                    instance_data.plugin.set_status(&mut instance_data.params, "⚡ Lecture rapide activée : à décocher avant l'export", "L'option « Lecture rapide (montage) » est cochée : l'image est un peu moins nette pour une lecture plus fluide. Décoche-la avant d'exporter.", false);
                 } else if instance_data.params.get_bool(Params::ToggleOverview).unwrap_or(false) {
                     instance_data.plugin.set_status(&mut instance_data.params, "⚠ Aperçu activé : à décocher avant l'export", "L'option « Aperçu de la stabilisation » est cochée : l'image est dézoomée pour montrer le cadre. Décoche-la avant d'exporter, sinon l'export sera dézoomé.", false);
                 } else if (src_fps - fps).abs() > 0.01 && src_frame.is_none() {
@@ -431,7 +449,7 @@ impl Execute for GyroflowPlugin {
                     };
                     match processed {
                         Ok(_) => {
-                            // log::info!("Rendered | {}x{} in {:.2}ms: {:?}", src_size.0, src_size.1, _time.elapsed().as_micros() as f64 / 1000.0, _);
+                            // log::info!("Rendered | {}x{} in {:.2}ms", src_size.0, src_size.1, _time.elapsed().as_micros() as f64 / 1000.0);
                             OK
                         },
                         Err(e) => {
@@ -468,6 +486,7 @@ impl Execute for GyroflowPlugin {
                         open_in_gyroflow:         param_set.parameter("OpenGyroflow")?,
                         reload_project:           param_set.parameter("ReloadProject")?,
                         toggle_overview:          param_set.parameter("ToggleOverview")?,
+                        fast_preview:             param_set.parameter("FastPreview")?,
                         dont_draw_outside:        param_set.parameter("DontDrawOutside")?,
                         include_project_data:     param_set.parameter("IncludeProjectData")?,
                         input_rotation:           param_set.parameter("InputRotation")?,
@@ -495,6 +514,8 @@ impl Execute for GyroflowPlugin {
                         loaded_project:           param_set.parameter("LoadedProject")?,
                         loaded_lens:              param_set.parameter("LoadedLens")?,
                         zoom_info:                param_set.parameter("ZoomInfo")?,
+                        use_original:             param_set.parameter("UseOriginal")?,
+                        load_suggested_lens:      param_set.parameter("LoadSuggestedLens")?,
                         loaded_preset:            param_set.parameter("LoadedPreset")?,
 
                         //fusion_start_frame:       param_set.parameter("FusionStartFrame")?,
@@ -517,6 +538,9 @@ impl Execute for GyroflowPlugin {
                         anamorphic_adjust_size:      true,
                         fixed_output_size:           false,
                         last_out_size:               (0, 0),
+                        original_candidate:          Default::default(),
+                        lens_suggestion:             None,
+                        suggestion_buttons:          (None, None),
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,

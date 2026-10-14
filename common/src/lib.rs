@@ -70,6 +70,9 @@ pub enum Params {
     AdvancedGroup, AdvancedGroupEnd,
     QuickPreset,
     ZoomInfo,
+    UseOriginal,
+    LoadSuggestedLens,
+    FastPreview,
 }
 
 thread_local! {
@@ -307,6 +310,114 @@ impl GyroflowPluginBase {
         }
     }
 
+    /// The original camera file of `path`, a clip without motion data (a transcode or an export of the original): a file of
+    /// the same name elsewhere, with motion data, at the same frame rate and duration
+    pub fn find_original(path: &str, fps: f64, duration_ms: f64) -> Option<String> {
+        let p = std::path::Path::new(path);
+        let name = p.file_name()?.to_string_lossy().to_string();
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        #[cfg(target_os = "macos")]
+        if let Ok(out) = std::process::Command::new("/usr/bin/mdfind").args(["-name", &name]).output() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                candidates.push(std::path::PathBuf::from(line));
+            }
+        }
+        // And around the clip, for volumes Spotlight doesn't index
+        fn walk(dir: &std::path::Path, name: &str, depth: usize, out: &mut Vec<std::path::PathBuf>, budget: &mut usize) {
+            if depth == 0 || *budget == 0 { return; }
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    if *budget == 0 { return; }
+                    *budget -= 1;
+                    let ep = e.path();
+                    if ep.is_dir() {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        if !n.starts_with('.') && n != "Proxy" && n != "CacheClip" { walk(&ep, name, depth - 1, out, budget); }
+                    } else if e.file_name().to_string_lossy().eq_ignore_ascii_case(name) {
+                        out.push(ep);
+                    }
+                }
+            }
+        }
+        if let Some(root) = p.parent().and_then(|x| x.parent()).and_then(|x| x.parent()) {
+            let mut budget = 20000;
+            walk(root, &name, 4, &mut candidates, &mut budget);
+        }
+        candidates.sort();
+        candidates.dedup();
+        for c in candidates {
+            if c == p || !c.is_file() || !c.file_name().map(|x| x.to_string_lossy().eq_ignore_ascii_case(&name)).unwrap_or(false) { continue; }
+            let cs = c.to_string_lossy().to_string();
+            if cs.contains("/Proxy/") || cs.contains("/CacheClip/") || cs.contains("/.Trash") { continue; }
+            let url = filesystem::path_to_url(&cs);
+            let Ok(mut file) = filesystem::open_file(&url, false, false) else { continue; };
+            let filesize = file.size;
+            let stab = StabilizationManager::default();
+            if stab.load_video_file(file.get_file(), filesize, &url, None, true).is_err() { continue; }
+            let (c_fps, c_dur) = { let p = stab.params.read(); (p.fps, p.duration_ms) };
+            let has_gyro = !stab.gyro.read().quaternions.is_empty();
+            let same_fps = (c_fps - fps).abs() <= fps.max(c_fps) * 0.005;
+            let same_dur = (c_dur - duration_ms).abs() <= (3000.0 / fps.max(1.0)).max(duration_ms * 0.002);
+            log::info!("Original candidate {cs}: gyro {has_gyro}, fps {c_fps} vs {fps}, duration {c_dur} vs {duration_ms}");
+            if has_gyro && same_fps && same_dur {
+                return Some(cs);
+            }
+        }
+        None
+    }
+
+    /// A lens profile of the database for the camera of the loaded clip: (name, json)
+    pub fn suggest_lens(stab: &StabilizationManager) -> Option<(String, String)> {
+        let (brand, model, lens) = {
+            let gyro = stab.gyro.read();
+            let md = gyro.file_metadata.read();
+            let c = md.camera_identifier.as_ref()?;
+            (c.brand.clone(), c.model.clone(), c.lens_model.clone())
+        };
+        if brand.is_empty() && model.is_empty() { return None; }
+        let mut db = stab.lens_profile_db.write();
+        if !db.loaded { return None; }
+        db.prepare_list_for_ui();
+        let size = stab.params.read().size;
+        let aspect = ((size.0 as f64 / size.1.max(1) as f64) * 1000.0).round() as i32;
+        let swapped = ((size.1 as f64 / size.0.max(1) as f64) * 1000.0).round() as i32;
+        let none = std::collections::HashSet::new();
+        // The database names cameras the way they're sold: Sony's ILCE-7CM2 is the a7C II
+        let friendly = {
+            let m = model.trim().to_uppercase();
+            if let Some(rest) = m.strip_prefix("ILCE-") {
+                let mut r = rest.to_string();
+                for (a, b) in [("M5", " V"), ("M4", " IV"), ("M3", " III"), ("M2", " II")] {
+                    if r.ends_with(a) { r = format!("{}{}", &r[..r.len() - 2], b); break; }
+                }
+                format!("a{r}")
+            } else {
+                model.trim().to_string()
+            }
+        };
+        let phrase = friendly.to_lowercase();
+        // The model as a whole in the name: "a7c ii" mustn't match "a7C ... MKII"
+        let names_model = |name: &str| {
+            let name = name.to_lowercase();
+            name.match_indices(&phrase).any(|(i, _)| {
+                let before = name[..i].chars().last().map_or(true, |c| !c.is_alphanumeric());
+                let after = name[i + phrase.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+                before && after
+            })
+        };
+        for query in [format!("{brand} {friendly} {lens}"), format!("{brand} {friendly}"), friendly.clone()] {
+            if query.trim().is_empty() { continue; }
+            if let Some(first) = db.search(&query, &none, aspect, swapped).into_iter().find(|x| !x.1.ends_with(".gyroflow") && names_model(&x.0)) {
+                if let Some(profile) = db.find(&first.1) {
+                    if let Ok(json) = profile.get_json() {
+                        return Some((first.0.clone(), json));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn get_project_path(file_path: &str) -> Option<String> {
         let mut project_path = std::path::Path::new(file_path).with_extension("gyroflow");
         if !project_path.exists() {
@@ -398,7 +509,7 @@ impl GyroflowPluginBase {
         }
     }
 
-    pub fn get_param_definitions() -> [ParameterType; 15] {
+    pub fn get_param_definitions() -> [ParameterType; 16] {
         [
             ParameterType::HiddenString { id: "InstanceId" },
             ParameterType::HiddenString { id: "ProjectPath" },
@@ -407,6 +518,7 @@ impl GyroflowPluginBase {
             ParameterType::HiddenString { id: "EmbeddedPreset" },
             ParameterType::Group { id: "ProjectGroup", label: "Plan", opened: true, parameters: vec![
                 ParameterType::Text    { id: "Status",            label: "État",                     hint: "État de la stabilisation pour ce plan. Survole ce champ pour le détail et la marche à suivre." },
+                ParameterType::Button  { id: "UseOriginal",       label: "Utiliser l'original trouvé", hint: "Ce plan n'a pas de données gyro, mais le fichier original de la caméra a été trouvé sur le disque : clique pour stabiliser avec lui." },
                 ParameterType::Button  { id: "LoadCurrent",       label: "Stabiliser ce plan",       hint: "Charge automatiquement les données gyro du plan (ou son projet .gyroflow s'il existe à côté du fichier) et lance la stabilisation." },
             ] },
             ParameterType::Group { id: "AdjustGroup", label: "Réglages", opened: true, parameters: vec![
@@ -448,6 +560,7 @@ impl GyroflowPluginBase {
                 ParameterType::Button   { id: "OutputSizeSwap",  label: "Inverser largeur / hauteur", hint: "Échange la largeur et la hauteur (horizontal ↔ vertical)" },
                 ParameterType::Select   { id: "Interpolation",   label: "Interpolation", hint: "Méthode de mise à l'échelle. Lanczos4 = la plus nette.", options: vec!["Lanczos4", "RobidouxSharp", "Bilinear", "Bicubic", "Robidoux", "Mitchell", "CatmullRom"], default: "Lanczos4" },
             ] },
+            ParameterType::Checkbox { id: "FastPreview",        label: "Lecture rapide (montage)", hint: "Utilise une interpolation plus rapide (bilinéaire) pour une lecture plus fluide pendant le montage, au prix d'une image un peu moins nette. À DÉSACTIVER avant l'export.", default: false },
             ParameterType::Checkbox { id: "ToggleOverview",     label: "Aperçu de la stabilisation", hint: "Dézoome l'affichage pour voir le cadre stabilisé et les bords. À DÉSACTIVER avant l'export.", default: false },
             ParameterType::Checkbox { id: "DontDrawOutside",    label: "Ne pas dessiner hors du plan", hint: "Si le format du plan et de la timeline diffèrent, garde l'image dans le cadre du plan d'origine.", default: false },
             ParameterType::Checkbox { id: "IncludeProjectData", label: "Intégrer les données au projet", hint: "Enregistre les données Gyroflow (gyro compris) dans le projet Resolve : utile pour partager le projet sans les fichiers .gyroflow, mais le projet devient plus lourd.", default: false },
@@ -455,6 +568,7 @@ impl GyroflowPluginBase {
                 ParameterType::Text { id: "LoadedProject",      label: "Fichier chargé",      hint: "Projet ou vidéo chargé" },
                 ParameterType::Text { id: "LoadedPreset",       label: "Préréglage chargé",   hint: "Préréglage chargé" },
                 ParameterType::Text { id: "LoadedLens",         label: "Profil d'objectif",   hint: "Profil d'objectif chargé" },
+                ParameterType::Button { id: "LoadSuggestedLens", label: "Charger le profil suggéré", hint: "Charge le profil d'objectif de la base Gyroflow qui correspond à la caméra de ce plan." },
                 ParameterType::Text { id: "ZoomInfo",           label: "Zoom appliqué",       hint: "Zoom maximum réellement appliqué sur ce plan pour masquer les bords. Plus il est élevé, plus tu perds de l'image." },
             ] },
         ]
@@ -600,6 +714,12 @@ pub struct GyroflowPluginBaseInstance {
     pub fixed_output_size: bool,
     /// The output buffer's size at the last render, to fit the output size to again when parameters change
     pub last_out_size: (usize, usize),
+    /// The original camera file found for a clip without motion data (see `find_original`)
+    pub original_candidate: Arc<Mutex<Option<String>>>,
+    /// A lens profile of the database for the clip's camera, when none is loaded: (name, json)
+    pub lens_suggestion: Option<(String, String)>,
+    /// The enabled state last given to the buttons that depend on the above
+    pub suggestion_buttons: (Option<bool>, Option<bool>),
 
     pub opencl_disabled: bool,
 }
@@ -622,6 +742,9 @@ impl Clone for GyroflowPluginBaseInstance {
             anamorphic_adjust_size:         self.anamorphic_adjust_size,
             fixed_output_size:              self.fixed_output_size,
             last_out_size:                  self.last_out_size,
+            original_candidate:             self.original_candidate.clone(),
+            lens_suggestion:                self.lens_suggestion.clone(),
+            suggestion_buttons:             (None, None),
             keyframable_params:             Arc::new(RwLock::new(self.keyframable_params.read().clone())),
         }
     }
@@ -645,6 +768,9 @@ impl Default for GyroflowPluginBaseInstance {
             anamorphic_adjust_size:         true,
             fixed_output_size:              false,
             last_out_size:                  (0, 0),
+            original_candidate:             Default::default(),
+            lens_suggestion:                None,
+            suggestion_buttons:             (None, None),
             keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                 use_gyroflows_keyframes:  false, // TODO param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
                 cached_keyframes:         KeyframeManager::default()
@@ -1128,6 +1254,17 @@ impl GyroflowPluginBaseInstance {
                             }
                         }
                         params.set_string(Params::LoadedProject, &filesystem::get_filename(&filesystem::path_to_url(&path)))?;
+                        *self.original_candidate.lock() = None;
+                        if stab.gyro.read().quaternions.is_empty() {
+                            let candidate = self.original_candidate.clone();
+                            let (fps, duration_ms) = { let p = stab.params.read(); (p.fps, p.duration_ms) };
+                            let clip = path.clone();
+                            std::thread::spawn(move || {
+                                let found = GyroflowPluginBase::find_original(&clip, fps, duration_ms);
+                                log::info!("Original of {clip}: {found:?}");
+                                *candidate.lock() = found;
+                            });
+                        }
                         if !stab.gyro.read().file_metadata.read().has_accurate_timestamps && open_gyroflow_if_no_data {
                             GyroflowPluginBase::open_gyroflow(params.get_string(Params::ProjectPath).ok().as_deref());
                         }
@@ -1216,8 +1353,14 @@ impl GyroflowPluginBaseInstance {
                             md.camera_identifier.as_ref().map(|c| format!("{} {}", c.brand, c.model).trim().to_string()).filter(|x| !x.is_empty())
                                 .or_else(|| md.detected_source.clone()).unwrap_or_default()
                         };
+                        self.lens_suggestion = None;
                         if lens_name == "---" || lens_name.is_empty() {
-                            let txt = if camera.is_empty() { "⚠ Aucun profil d'objectif".to_string() } else { format!("⚠ Aucun profil d'objectif ({camera})") };
+                            self.lens_suggestion = GyroflowPluginBase::suggest_lens(&stab);
+                            let txt = match (&self.lens_suggestion, camera.is_empty()) {
+                                (Some((name, _)), _) => format!("⚠ Aucun profil (suggéré : {name})"),
+                                (None, true) => "⚠ Aucun profil d'objectif".to_string(),
+                                (None, false) => format!("⚠ Aucun profil d'objectif ({camera})"),
+                            };
                             params.set_string(Params::LoadedLens, &txt)?;
                             params.set_hint(Params::LoadedLens, "Aucun profil d'objectif n'est chargé : la correction d'objectif et la stabilisation seront approximatives. Charge un profil via « Projet Gyroflow > Charger un profil / préréglage… », ou crée-le dans l'application Gyroflow.")?;
                         } else {
@@ -1470,6 +1613,24 @@ impl GyroflowPluginBaseInstance {
                     self.clear_stab(&manager_cache);
                 }
             }
+        }
+        if param == Params::UseOriginal {
+            let candidate = self.original_candidate.lock().clone();
+            if let Some(original) = candidate {
+                self.pick_project(params, manager_cache, &original)?;
+            }
+        }
+        if param == Params::LoadSuggestedLens {
+            if let Some((_, json)) = self.lens_suggestion.clone() {
+                params.set_string(Params::EmbeddedLensProfile, &json)?;
+                self.reload_values_from_project = true;
+                self.clear_stab(&manager_cache);
+            }
+        }
+        if param == Params::FastPreview && user_edited {
+            let fast = params.get_bool(Params::FastPreview).unwrap_or(false);
+            params.set_i32(Params::Interpolation, if fast { 2 } else { 0 })?; // Bilinear / Lanczos4
+            self.param_changed(params, manager_cache, Params::Interpolation, true)?;
         }
         if param == Params::QuickPreset && user_edited {
             // (lissage, zoom max, verrouillage horizon)

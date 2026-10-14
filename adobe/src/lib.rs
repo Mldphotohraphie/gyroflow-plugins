@@ -403,6 +403,9 @@ impl CrossThreadInstance {
             anamorphic_adjust_size:         false,
             fixed_output_size:              false,
             last_out_size:                  (0, 0),
+            original_candidate:             Default::default(),
+            lens_suggestion:                None,
+            suggestion_buttons:             (None, None),
             keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                 use_gyroflows_keyframes:  false,
                 cached_keyframes:         KeyframeManager::default()
