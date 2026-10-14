@@ -77,6 +77,7 @@ define_params!(ParamHandler {
     i32s: [
         Interpolation         => interpolation:            ParamHandle<Int>,
         IntegrationMethod     => integration_method:       ParamHandle<Int>,
+        QuickPreset           => quick_preset:             ParamHandle<Int>,
     ],
 
     get_string:  _s p    { Ok(p.get_value()?) },
@@ -217,10 +218,10 @@ impl Execute for GyroflowPlugin {
                         org_ratio = 1.0 / org_ratio;
                     }
                 }
-                let (has_accurate_timestamps, has_offsets) = {
+                let (has_accurate_timestamps, has_offsets, has_gyro) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
-                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty())
+                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty(), !gyro.quaternions.is_empty())
                 };
 
                 let mut speed_stretch = 1.0;
@@ -240,10 +241,13 @@ impl Execute for GyroflowPlugin {
                     speed_stretch = 1.0;
                 }
 
-                if (src_fps - fps).abs() > 0.01 {
-                    instance_data.plugin.set_status(&mut instance_data.params, "Timeline fps mismatch!", "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
+                if !has_gyro {
+                    instance_data.plugin.set_status(&mut instance_data.params, "Pas de données gyro dans ce fichier", "Ce fichier ne contient pas de données gyroscopiques (fichier réexporté, transcodé, ou caméra sans gyro). Utilise le fichier original sorti de la caméra, ou ouvre le plan dans Gyroflow pour charger un fichier de mouvement séparé.", false);
+                } else if (src_fps - fps).abs() > 0.01 {
+                    let status = format!("Cadence différente : plan {fps:.3} i/s, timeline {src_fps:.3} i/s");
+                    instance_data.plugin.set_status(&mut instance_data.params, &status, "Le plan n'a pas la même cadence que la timeline (ralenti, plan conformé, ou fichier réexporté à une autre cadence). Solutions : utiliser le plugin dans la page Fusion, ou remettre le plan à sa cadence d'origine. Si l'écart est infime (ex. 24,985 au lieu de 25), le fichier a sans doute été réexporté : reprends l'original de la caméra.", false);
                 } else if !has_accurate_timestamps && !has_offsets {
-                    instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
+                    instance_data.plugin.set_status(&mut instance_data.params, "Non synchronisé : ouvre dans Gyroflow", "Les données gyro ne sont pas synchronisées avec l'image. Ouvre le plan dans Gyroflow (section Projet Gyroflow), lance la synchronisation automatique, enregistre, puis clique Recharger le projet.", false);
                 } else {
                     instance_data.plugin.set_status(&mut instance_data.params, "OK", "OK", true);
                 }
@@ -502,6 +506,7 @@ impl Execute for GyroflowPlugin {
                         output_size_fit:          param_set.parameter("OutputSizeToTimeline")?,
                         interpolation:            param_set.parameter("Interpolation")?,
                         integration_method:       param_set.parameter("IntegrationMethod")?,
+                        quick_preset:             param_set.parameter("QuickPreset")?,
 
                         loaded_project:           param_set.parameter("LoadedProject")?,
                         loaded_lens:              param_set.parameter("LoadedLens")?,
@@ -703,6 +708,8 @@ impl Execute for GyroflowPlugin {
                     .set_children(&[
                         "ProjectGroup",
                         "AdjustGroup",
+                        "AdvancedGroup",
+                        "ProjectAdvancedGroup",
                         "KeyframesGroup",
                         "ToggleOverview", "DontDrawOutside", "IncludeProjectData"
                     ])?;
