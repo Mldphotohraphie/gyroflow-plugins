@@ -539,8 +539,17 @@ impl GyroflowPluginBaseInstance {
     }
     pub fn cache_keyframes(&mut self, params: &dyn GyroflowPluginParams, use_gyroflows_keyframes: bool, num_frames: usize, fps: f64) {
         let mut mgr = KeyframeManager::new();
+        // Portrait clips (stored landscape with a 90/270 rotation, applied both as input and video rotation)
+        // end up upside down when the horizon is locked: compensate with a 180° roll offset.
+        let horizon_roll_offset = {
+            let input_rot = params.get_f64(Params::InputRotation).unwrap_or(0.0).rem_euclid(360.0);
+            let video_rot = params.get_f64(Params::Rotation).unwrap_or(0.0).rem_euclid(360.0);
+            let is_portrait = (input_rot - 90.0).abs() < 1.0 || (input_rot - 270.0).abs() < 1.0;
+            if is_portrait && (video_rot - input_rot).abs() < 1.0 { 180.0 } else { 0.0 }
+        };
         macro_rules! cache_key {
-            ($typ:expr, $param:expr, $scale:expr) => {
+            ($typ:expr, $param:expr, $scale:expr) => { cache_key!($typ, $param, $scale, 0.0) };
+            ($typ:expr, $param:expr, $scale:expr, $offset:expr) => {
                 if params.is_keyframed($param) {
                     log::info!("param: {:?} is keyframed, cache_keyframes_every_frame: {}", $param, self.cache_keyframes_every_frame);
                     if self.cache_keyframes_every_frame { // Query every frame
@@ -549,7 +558,7 @@ impl GyroflowPluginBaseInstance {
                             let timestamp_us = ((time / fps * 1_000_000.0)).round() as i64;
 
                             if let Ok(v) = params.get_f64_at_time($param, TimeType::FrameOrMicrosecond((Some(time), Some(timestamp_us)))) {
-                                mgr.set(&$typ, timestamp_us, v / $scale);
+                                mgr.set(&$typ, timestamp_us, v / $scale + $offset);
                             }
                         }
                     } else {
@@ -564,13 +573,13 @@ impl GyroflowPluginBaseInstance {
                                 TimeType::FrameOrMicrosecond((None, None)) => unreachable!(),
                             };
 
-                            mgr.set(&$typ, timestamp_us, v / $scale);
+                            mgr.set(&$typ, timestamp_us, v / $scale + $offset);
                         }
                     }
                 } else {
                     log::info!("param: {:?} NOT keyframed", $param);
                     if let Ok(v) = params.get_f64($param) {
-                        mgr.set(&$typ, 0, v / $scale);
+                        mgr.set(&$typ, 0, v / $scale + $offset);
                     }
                 }
             };
@@ -580,7 +589,7 @@ impl GyroflowPluginBaseInstance {
         cache_key!(KeyframeType::SmoothingParamSmoothness,  Params::Smoothness,             100.0);
         cache_key!(KeyframeType::LensCorrectionStrength,    Params::LensCorrectionStrength, 100.0);
         cache_key!(KeyframeType::LockHorizonAmount,         Params::HorizonLockAmount,      1.0);
-        cache_key!(KeyframeType::LockHorizonRoll,           Params::HorizonLockRoll,        1.0);
+        cache_key!(KeyframeType::LockHorizonRoll,           Params::HorizonLockRoll,        1.0, horizon_roll_offset);
         cache_key!(KeyframeType::VideoSpeed,                Params::VideoSpeed,             100.0);
         cache_key!(KeyframeType::VideoRotation,             Params::Rotation,               1.0);
         //cache_key!(KeyframeType::ZoomingCenterX,            Params::PositionX,              100.0);
