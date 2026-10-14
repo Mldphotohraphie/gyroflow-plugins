@@ -42,6 +42,7 @@ define_params!(ParamHandler {
         LoadedProject       => loaded_project:   ParamHandle<String>,
         LoadedPreset        => loaded_preset:    ParamHandle<String>,
         LoadedLens          => loaded_lens:      ParamHandle<String>,
+        ZoomInfo            => zoom_info:        ParamHandle<String>,
     ],
     bools: [
         DisableStretch        => disable_stretch:         ParamHandle<bool>,
@@ -71,6 +72,7 @@ define_params!(ParamHandler {
     i32s: [
         Interpolation         => interpolation:            ParamHandle<Int>,
         IntegrationMethod     => integration_method:       ParamHandle<Int>,
+        QuickPreset           => quick_preset:             ParamHandle<Int>,
     ],
 
     get_string:  _s p    { Ok(p.get_value()?) },
@@ -202,10 +204,11 @@ impl Execute for GyroflowPlugin {
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
                 let video_size = params.size;
-                let (has_accurate_timestamps, has_offsets) = {
+                let min_fov = params.min_fov;
+                let (has_accurate_timestamps, has_offsets, has_gyro) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
-                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty())
+                    (md.has_accurate_timestamps, !gyro.get_offsets().is_empty(), !gyro.quaternions.is_empty())
                 };
 
                 let mut speed_stretch = 1.0;
@@ -225,12 +228,27 @@ impl Execute for GyroflowPlugin {
                     speed_stretch = 1.0;
                 }
 
-                if (src_fps - fps).abs() > 0.01 {
-                    instance_data.plugin.set_status(&mut instance_data.params, "Timeline fps mismatch!", "Timeline frame rate doesn't match the clip frame rate! Use the plugin in Fusion instead", false);
+                // Resolve tells us which source frame is shown, even for retimed / slow motion clips.
+                // When it does, the gyro timestamps are exact and a frame rate difference is not a problem.
+                let src_frame = in_args.get_src_frame().ok();
+
+                if !has_gyro {
+                    instance_data.plugin.set_status(&mut instance_data.params, "Pas de données gyro dans ce fichier", "Ce fichier ne contient pas de données gyroscopiques (fichier réexporté, transcodé, ou caméra sans gyro). Utilise le fichier original sorti de la caméra, ou ouvre le plan dans Gyroflow pour charger un fichier de mouvement séparé.", false);
+                } else if instance_data.params.get_bool(Params::ToggleOverview).unwrap_or(false) {
+                    instance_data.plugin.set_status(&mut instance_data.params, "⚠ Aperçu activé : à décocher avant l'export", "L'option « Aperçu de la stabilisation » est cochée : l'image est dézoomée pour montrer le cadre. Décoche-la avant d'exporter, sinon l'export sera dézoomé.", false);
+                } else if (src_fps - fps).abs() > 0.01 && src_frame.is_none() {
+                    let status = format!("Cadence différente : plan {fps:.3} i/s, timeline {src_fps:.3} i/s");
+                    instance_data.plugin.set_status(&mut instance_data.params, &status, "Le plan n'a pas la même cadence que la timeline (ralenti, plan conformé, ou fichier réexporté à une autre cadence). Solutions : utiliser le plugin dans la page Fusion, ou remettre le plan à sa cadence d'origine. Si l'écart est infime (ex. 24,985 au lieu de 25), le fichier a sans doute été réexporté : reprends l'original de la caméra.", false);
                 } else if !has_accurate_timestamps && !has_offsets {
-                    instance_data.plugin.set_status(&mut instance_data.params, "Not synced. Open in Gyroflow", "Gyro data is not synced with the video, open the video in Gyroflow and add sync points (eg. by doing autosync)", false);
+                    instance_data.plugin.set_status(&mut instance_data.params, "Non synchronisé : ouvre dans Gyroflow", "Les données gyro ne sont pas synchronisées avec l'image. Ouvre le plan dans Gyroflow (section Projet Gyroflow), lance la synchronisation automatique, enregistre, puis clique Recharger le projet.", false);
                 } else {
                     instance_data.plugin.set_status(&mut instance_data.params, "OK", "OK", true);
+                }
+                if min_fov > 0.0001 && has_gyro {
+                    let zoom = format!("{:.1} %", 100.0 / min_fov).replace('.', ",");
+                    if instance_data.params.get_string(Params::ZoomInfo).unwrap_or_default() != zoom {
+                        let _ = instance_data.params.set_string(Params::ZoomInfo, &zoom);
+                    }
                 }
 
                 let mut time = time;
@@ -244,7 +262,7 @@ impl Execute for GyroflowPlugin {
                     let frame = (time / src_fps) * fps * speed_stretch;
                     timestamp_us = (frame.floor() * (1_000_000.0 / fps)).round() as i64;
                 }
-                if let Ok(frame) = in_args.get_src_frame() {
+                if let Some(frame) = src_frame {
                     timestamp_us = (frame as f64 * (1_000_000.0 / fps)).round() as i64;
                 }
 
@@ -472,9 +490,11 @@ impl Execute for GyroflowPlugin {
                         output_size_fit:          param_set.parameter("OutputSizeToTimeline")?,
                         interpolation:            param_set.parameter("Interpolation")?,
                         integration_method:       param_set.parameter("IntegrationMethod")?,
+                        quick_preset:             param_set.parameter("QuickPreset")?,
 
                         loaded_project:           param_set.parameter("LoadedProject")?,
                         loaded_lens:              param_set.parameter("LoadedLens")?,
+                        zoom_info:                param_set.parameter("ZoomInfo")?,
                         loaded_preset:            param_set.parameter("LoadedPreset")?,
 
                         //fusion_start_frame:       param_set.parameter("FusionStartFrame")?,
@@ -676,6 +696,8 @@ impl Execute for GyroflowPlugin {
                     .set_children(&[
                         "ProjectGroup",
                         "AdjustGroup",
+                        "AdvancedGroup",
+                        "ProjectAdvancedGroup",
                         "KeyframesGroup",
                         "ToggleOverview", "DontDrawOutside", "IncludeProjectData"
                     ])?;
