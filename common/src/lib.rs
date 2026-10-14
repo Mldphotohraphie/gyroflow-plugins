@@ -72,6 +72,7 @@ pub enum Params {
     ProjectAdvancedGroup, ProjectAdvancedGroupEnd,
     AdvancedGroup, AdvancedGroupEnd,
     QuickPreset,
+    ZoomInfo,
 }
 
 thread_local! {
@@ -364,6 +365,7 @@ impl GyroflowPluginBase {
                 ParameterType::Text { id: "LoadedProject",      label: "Fichier chargé",      hint: "Projet ou vidéo chargé" },
                 ParameterType::Text { id: "LoadedPreset",       label: "Préréglage chargé",   hint: "Préréglage chargé" },
                 ParameterType::Text { id: "LoadedLens",         label: "Profil d'objectif",   hint: "Profil d'objectif chargé" },
+                ParameterType::Text { id: "ZoomInfo",           label: "Zoom appliqué",       hint: "Zoom maximum réellement appliqué sur ce plan pour masquer les bords. Plus il est élevé, plus tu perds de l'image." },
             ] },
         ]
     }
@@ -430,6 +432,7 @@ pub struct GyroflowPluginBaseInstance {
     pub reload_values_from_project: bool,
 
     pub original_video_size: (usize, usize),
+    pub source_size: (usize, usize),
     pub original_output_size: (usize, usize),
     pub timeline_size: (usize, usize),
     pub num_frames: usize,
@@ -450,6 +453,7 @@ impl Clone for GyroflowPluginBaseInstance {
             manager_cache_generation:       self.manager_cache_generation,
             original_output_size:           self.original_output_size,
             original_video_size:            self.original_video_size,
+            source_size:                    self.source_size,
             timeline_size:                  self.timeline_size,
             num_frames:                     self.num_frames,
             fps:                            self.fps,
@@ -472,6 +476,7 @@ impl Default for GyroflowPluginBaseInstance {
             manager_cache_generation:       0,
             original_output_size:           (0, 0),
             original_video_size:            (0, 0),
+            source_size:                    (0, 0),
             timeline_size:                  (0, 0),
             num_frames:                     0,
             fps:                            0.0,
@@ -747,6 +752,7 @@ impl GyroflowPluginBaseInstance {
                 }
             }
 
+            let mut swap_output_size = false;
             let loaded = {
                 stab.params.write().calculate_ramped_timestamps(&stab.keyframes.read(), false, true);
                 let gf_params = stab.params.read();
@@ -773,6 +779,14 @@ impl GyroflowPluginBaseInstance {
                     params.set_f64(Params::Rotation,               gf_params.video_rotation)?;
                     params.set_i32(Params::IntegrationMethod,      stab.gyro.read().integration_method as i32)?;
 
+                    // A portrait clip whose project output size is landscape (or the opposite): follow the clip's orientation
+                    let (sw, sh) = self.source_size;
+                    let (ow, oh) = self.original_output_size;
+                    if sw > 0 && sh > 0 && ow > 0 && oh > 0 && ow != oh && sw != sh && (sh > sw) != (oh > ow) {
+                        log::info!("Output size {ow}x{oh} doesn't match the clip orientation {sw}x{sh}, swapping");
+                        self.original_output_size = (oh, ow);
+                        swap_output_size = true;
+                    }
                     params.set_f64(Params::OutputWidth,            self.original_output_size.0 as f64)?;
                     params.set_f64(Params::OutputHeight,           self.original_output_size.1 as f64)?;
 
@@ -792,7 +806,24 @@ impl GyroflowPluginBaseInstance {
                     if let Some(name) = stab.input_file.read().preset_name.clone() {
                         params.set_string(Params::LoadedPreset, &name)?;
                     }
-                    params.set_string(Params::LoadedLens, &stab.lens.read().get_display_name())?;
+                    {
+                        let lens_name = stab.lens.read().get_display_name();
+                        let camera = {
+                            let gyro = stab.gyro.read();
+                            let md = gyro.file_metadata.read();
+                            md.camera_identifier.as_ref().map(|c| format!("{} {}", c.brand, c.model).trim().to_string()).filter(|x| !x.is_empty())
+                                .or_else(|| md.detected_source.clone()).unwrap_or_default()
+                        };
+                        if lens_name == "---" || lens_name.is_empty() {
+                            let txt = if camera.is_empty() { "⚠ Aucun profil d'objectif".to_string() } else { format!("⚠ Aucun profil d'objectif ({camera})") };
+                            params.set_string(Params::LoadedLens, &txt)?;
+                            params.set_hint(Params::LoadedLens, "Aucun profil d'objectif n'est chargé : la correction d'objectif et la stabilisation seront approximatives. Charge un profil via « Projet Gyroflow > Charger un profil / préréglage… », ou crée-le dans l'application Gyroflow.")?;
+                        } else {
+                            let txt = if camera.is_empty() { lens_name } else { format!("{lens_name} · {camera}") };
+                            params.set_string(Params::LoadedLens, &txt)?;
+                            params.set_hint(Params::LoadedLens, "Profil d'objectif utilisé pour corriger la déformation.")?;
+                        }
+                    }
 
                     for k in all_keys {
                         if let Some(keys) = keyframes.get_keyframes(k) {
@@ -831,6 +862,9 @@ impl GyroflowPluginBaseInstance {
                 self.has_motion = stab.gyro.read().has_motion();
                 loaded
             };
+            if swap_output_size {
+                stab.set_output_size(self.original_output_size.0, self.original_output_size.1);
+            }
 
             self.update_loaded_state(params, loaded);
 

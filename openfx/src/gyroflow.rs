@@ -48,6 +48,7 @@ define_params!(ParamHandler {
         LoadedProject       => loaded_project:   ParamHandle<String>,
         LoadedPreset        => loaded_preset:    ParamHandle<String>,
         LoadedLens          => loaded_lens:      ParamHandle<String>,
+        ZoomInfo            => zoom_info:        ParamHandle<String>,
     ],
     bools: [
         DisableStretch        => disable_stretch:         ParamHandle<bool>,
@@ -138,6 +139,9 @@ impl InstanceData {
         }
         let in_size = ((source_rect.x2 - source_rect.x1) as usize, (source_rect.y2 - source_rect.y1) as usize);*/
         let out_size = ((output_rect.x2 - output_rect.x1) as usize, (output_rect.y2 - output_rect.y1) as usize);
+        if let Ok(src_rod) = self.source_clip.get_region_of_definition(0.0) {
+            self.plugin.source_size = ((src_rod.x2 - src_rod.x1).max(0.0) as usize, (src_rod.y2 - src_rod.y1).max(0.0) as usize);
+        }
 
         self.plugin.stab_manager(&mut self.params, manager_cache, out_size, loading_pending_video_file).map_err(|e| {
             log::error!("plugin.stab_manager error: {e:?}");
@@ -208,6 +212,7 @@ impl Execute for GyroflowPlugin {
                 let params = stab.params.read();
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
+                let min_fov = params.min_fov;
                 let mut org_ratio = params.size.0 as f64 / params.size.1 as f64;
                 // Portrait clips are stored landscape with a 90/270 rotation. The host gives us the upright
                 // (portrait) image, so the original aspect ratio must be inverted too, otherwise the center rect
@@ -241,15 +246,27 @@ impl Execute for GyroflowPlugin {
                     speed_stretch = 1.0;
                 }
 
+                // Resolve tells us which source frame is shown, even for retimed / slow motion clips.
+                // When it does, the gyro timestamps are exact and a frame rate difference is not a problem.
+                let src_frame = in_args.get_src_frame().ok();
+
                 if !has_gyro {
                     instance_data.plugin.set_status(&mut instance_data.params, "Pas de données gyro dans ce fichier", "Ce fichier ne contient pas de données gyroscopiques (fichier réexporté, transcodé, ou caméra sans gyro). Utilise le fichier original sorti de la caméra, ou ouvre le plan dans Gyroflow pour charger un fichier de mouvement séparé.", false);
-                } else if (src_fps - fps).abs() > 0.01 {
+                } else if instance_data.params.get_bool(Params::ToggleOverview).unwrap_or(false) {
+                    instance_data.plugin.set_status(&mut instance_data.params, "⚠ Aperçu activé : à décocher avant l'export", "L'option « Aperçu de la stabilisation » est cochée : l'image est dézoomée pour montrer le cadre. Décoche-la avant d'exporter, sinon l'export sera dézoomé.", false);
+                } else if (src_fps - fps).abs() > 0.01 && src_frame.is_none() {
                     let status = format!("Cadence différente : plan {fps:.3} i/s, timeline {src_fps:.3} i/s");
                     instance_data.plugin.set_status(&mut instance_data.params, &status, "Le plan n'a pas la même cadence que la timeline (ralenti, plan conformé, ou fichier réexporté à une autre cadence). Solutions : utiliser le plugin dans la page Fusion, ou remettre le plan à sa cadence d'origine. Si l'écart est infime (ex. 24,985 au lieu de 25), le fichier a sans doute été réexporté : reprends l'original de la caméra.", false);
                 } else if !has_accurate_timestamps && !has_offsets {
                     instance_data.plugin.set_status(&mut instance_data.params, "Non synchronisé : ouvre dans Gyroflow", "Les données gyro ne sont pas synchronisées avec l'image. Ouvre le plan dans Gyroflow (section Projet Gyroflow), lance la synchronisation automatique, enregistre, puis clique Recharger le projet.", false);
                 } else {
                     instance_data.plugin.set_status(&mut instance_data.params, "OK", "OK", true);
+                }
+                if min_fov > 0.0001 && has_gyro {
+                    let zoom = format!("{:.1} %", 100.0 / min_fov).replace('.', ",");
+                    if instance_data.params.get_string(Params::ZoomInfo).unwrap_or_default() != zoom {
+                        let _ = instance_data.params.set_string(Params::ZoomInfo, &zoom);
+                    }
                 }
 
                 let mut time = time;
@@ -263,8 +280,11 @@ impl Execute for GyroflowPlugin {
                     let frame = (time / src_fps) * fps * speed_stretch;
                     timestamp_us = (frame.floor() * (1_000_000.0 / fps)).round() as i64;
                 }
-                if let Ok(frame) = in_args.get_src_frame() {
+                if let Some(frame) = src_frame {
                     timestamp_us = (frame as f64 * (1_000_000.0 / fps)).round() as i64;
+                }
+                if (time as i64) % 25 == 0 {
+                    log::info!("[mld-retime] time: {time}, src_frame: {src_frame:?}, clip fps: {fps:.3}, host fps: {src_fps:.3}, speed_stretch: {speed_stretch}, timestamp_us: {timestamp_us}");
                 }
 
                 let source_timestamp_us = params.get_source_timestamp_at_ramped_timestamp(timestamp_us);
@@ -509,6 +529,7 @@ impl Execute for GyroflowPlugin {
                         quick_preset:             param_set.parameter("QuickPreset")?,
 
                         loaded_project:           param_set.parameter("LoadedProject")?,
+                        zoom_info:                param_set.parameter("ZoomInfo")?,
                         loaded_lens:              param_set.parameter("LoadedLens")?,
                         loaded_preset:            param_set.parameter("LoadedPreset")?,
 
@@ -521,6 +542,7 @@ impl Execute for GyroflowPlugin {
                         manager_cache_generation:    0,
                         original_output_size:        (0, 0),
                         original_video_size:         (0, 0),
+                        source_size:                 (0, 0),
                         timeline_size:               (0, 0),
                         num_frames:                  0,
                         fps:                         0.0,

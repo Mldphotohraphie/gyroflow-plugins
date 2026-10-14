@@ -93,6 +93,7 @@ impl CrossThreadInstance {
             manager_cache_generation:       0,
             original_output_size:           (0, 0),
             original_video_size:            (0, 0),
+            source_size:                    (0, 0),
             timeline_size:                  (0, 0),
             num_frames:                     0,
             fps:                            0.0,
