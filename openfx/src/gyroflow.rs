@@ -207,7 +207,16 @@ impl Execute for GyroflowPlugin {
                 let params = stab.params.read();
                 let fps = params.fps;
                 let src_fps = instance_data.source_clip.get_frame_rate().unwrap_or(fps);
-                let org_ratio = params.size.0 as f64 / params.size.1 as f64;
+                let mut org_ratio = params.size.0 as f64 / params.size.1 as f64;
+                // Portrait clips are stored landscape with a 90/270 rotation. The host gives us the upright
+                // (portrait) image, so the original aspect ratio must be inverted too, otherwise the center rect
+                // is computed as if the clip was horizontal and the picture gets stretched.
+                {
+                    let input_rot = instance_data.params.get_f64_at_time(Params::InputRotation, TimeType::Frame(time)).unwrap_or(0.0).rem_euclid(360.0);
+                    if (input_rot - 90.0).abs() < 1.0 || (input_rot - 270.0).abs() < 1.0 {
+                        org_ratio = 1.0 / org_ratio;
+                    }
+                }
                 let (has_accurate_timestamps, has_offsets) = {
                     let gyro = stab.gyro.read();
                     let md = gyro.file_metadata.read();
@@ -516,7 +525,7 @@ impl Execute for GyroflowPlugin {
                         cache_keyframes_every_frame: true,
                         framebuffer_inverted:        true,
                         anamorphic_adjust_size:      true,
-                        always_set_input_rotation:   false,
+                        always_set_input_rotation:   true, 
                         has_motion:                  false,
                         keyframable_params: Arc::new(RwLock::new(KeyframableParams {
                             use_gyroflows_keyframes: param_set.parameter::<Bool>("UseGyroflowsKeyframes")?.get_value()?,
